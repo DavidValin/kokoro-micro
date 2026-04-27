@@ -287,13 +287,14 @@ impl TtsEngine {
         let phonemes = text_to_phonemes(text, lang.unwrap_or(DEFAULT_LANG), None, true, false)
             .map_err(|e| format!("Failed to convert text to phonemes: {}", e))?;
 
-        // Join phonemes with spaces and add padding tokens at beginning and end
-        // Spaces between phonemes create natural pauses for commas and periods
-        // Padding tokens are crucial to prevent word dropping at beginning and end
+        // Join phonemes with spaces and pad with a single BOS/EOS token at each
+        // end. The Kokoro 82M model is trained against one boundary pad token
+        // per side; the previous "$$$" (three pads) pushed the input out of
+        // distribution and inflated the duration predictor at the boundaries.
+        // Matches upstream Kokoros (lucasjinreal/Kokoros)'s `vec![0]` pattern.
         let mut phonemes_text = phonemes.join(" ");
-        // Add multiple padding tokens for better buffering
-        phonemes_text.insert_str(0, "$$$");
-        phonemes_text.push_str("$$$");
+        phonemes_text.insert_str(0, "$");
+        phonemes_text.push_str("$");
 
         // Debug output only for long text
         if text.len() > 50 {
