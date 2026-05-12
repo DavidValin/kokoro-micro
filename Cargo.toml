@@ -1,8 +1,8 @@
 [package]
 name = "kokoro-micro"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
-authors = ["Hue & Aye <team@8b.is>"]
+authors = ["Hue & Aye <team@8b.is>", "David Valin <hola@davidvalin.com>", "mik-tf"]
 description = "Minimal TTS crate using Kokoro - perfect for embedding in other apps"
 license = "Apache-2.0"
 homepage = "https://github.com/DavidValin/kokoro-micro"
