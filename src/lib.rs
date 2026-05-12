@@ -71,7 +71,7 @@ fn get_cache_dir() -> PathBuf {
             debug_log!("⚠️  Could not determine HOME directory, using current directory");
             ".".to_string()
         });
-    
+
     Path::new(&home).join(".cache").join("k")
 }
 
@@ -85,7 +85,7 @@ pub struct TtsEngine {
 
 impl TtsEngine {
     /// Create a new TTS engine, downloading model files if necessary
-    /// 
+    ///
     /// Uses `$HOME/.cache/k/` for shared model storage on all platforms:
     /// - Linux/macOS: `$HOME/.cache/k/` (e.g., `/home/user/.cache/k/`)
     /// - Windows: `%USERPROFILE%/.cache/k/` (e.g., `C:\Users\Username\.cache\k\`)
@@ -200,7 +200,7 @@ impl TtsEngine {
         voice: Option<&str>,
         speed: f32,
         gain: f32,
-        lang: Option<&str>
+        lang: Option<&str>,
     ) -> Result<Vec<f32>, String> {
         // If in fallback mode, return the excuse message audio
         if self.fallback_mode {
@@ -218,12 +218,14 @@ impl TtsEngine {
         let clamped_speed = model_speed.clamp(MIN_ENGINE_SPEED, MAX_ENGINE_SPEED);
         let voice = voice.unwrap_or(DEFAULT_VOICE);
 
-        // Parse voice style (e.g., "af_sky.8+af_bella.2" for mixing)
-        let style = self.parse_voice_style(voice)?;
+        // Voice style is parsed *inside* synthesize_segment after tokenization,
+        // because Kokoro voice arrays are [max_seq_len, 1, 256] tables indexed
+        // by token count. Looking up the row up here would always return the
+        // style for the empty (0-token) sequence — see fix history.
 
         // Short form: synthesize in one pass for predictable cadence
         if !needs_chunking(text) {
-            let mut audio = self.synthesize_segment(session, &style, text, clamped_speed, lang)?;
+            let mut audio = self.synthesize_segment(session, voice, text, clamped_speed, lang)?;
             if gain != 1.0 {
                 audio = amplify_audio(&audio, gain);
             }
@@ -259,7 +261,8 @@ impl TtsEngine {
                 chunk.chars().count()
             );
 
-            let chunk_audio = self.synthesize_segment(session, &style, chunk, clamped_speed, lang)?;
+            let chunk_audio =
+                self.synthesize_segment(session, voice, chunk, clamped_speed, lang)?;
             append_with_crossfade(&mut combined_audio, &chunk_audio, overlap);
         }
 
@@ -278,22 +281,23 @@ impl TtsEngine {
     fn synthesize_segment(
         &self,
         session: &Arc<Mutex<Session>>,
-        style: &[f32],
+        voice: &str,
         text: &str,
         speed: f32,
-        lang: Option<&str>
+        lang: Option<&str>,
     ) -> Result<Vec<f32>, String> {
         // Convert text to phonemes
         let phonemes = text_to_phonemes(text, lang.unwrap_or(DEFAULT_LANG), None, true, false)
             .map_err(|e| format!("Failed to convert text to phonemes: {}", e))?;
 
-        // Join phonemes with spaces and add padding tokens at beginning and end
-        // Spaces between phonemes create natural pauses for commas and periods
-        // Padding tokens are crucial to prevent word dropping at beginning and end
+        // Join phonemes with spaces and pad with a single BOS/EOS token at each
+        // end. The Kokoro 82M model is trained against one boundary pad token
+        // per side; the previous "$$$" (three pads) pushed the input out of
+        // distribution and inflated the duration predictor at the boundaries.
+        // Matches upstream Kokoros (lucasjinreal/Kokoros)'s `vec![0]` pattern.
         let mut phonemes_text = phonemes.join(" ");
-        // Add multiple padding tokens for better buffering
-        phonemes_text.insert_str(0, "$$$");
-        phonemes_text.push_str("$$$");
+        phonemes_text.insert_str(0, "$");
+        phonemes_text.push_str("$");
 
         // Debug output only for long text
         if text.len() > 50 {
@@ -304,8 +308,17 @@ impl TtsEngine {
 
         let tokens = self.tokenize(phonemes_text);
 
+        // Per-segment style lookup: kokoro voice files are [max_seq_len, 1, 256]
+        // tables, and the model expects the row that matches the current token
+        // count (matches upstream Kokoros's `mix_styles(name, tokens.len())`).
+        // The previous code computed style up in synthesize_with_options before
+        // tokenisation and would therefore always feed style[0] (the empty-
+        // sequence embedding) regardless of the input — the root cause of the
+        // audible "first ~1s clear, rest is murmurs / silence" dropout.
+        let style = self.parse_voice_style(voice, tokens.len())?;
+
         // Run inference with user-specified speed directly
-        self.run_inference(session, tokens, style.to_vec(), speed)
+        self.run_inference(session, tokens, style, speed)
     }
 
     /// Save audio as WAV file
@@ -333,11 +346,9 @@ impl TtsEngine {
         Ok(())
     }
 
-
-
     // Private helper methods
 
-    fn parse_voice_style(&self, voice_str: &str) -> Result<Vec<f32>, String> {
+    fn parse_voice_style(&self, voice_str: &str, tokens_len: usize) -> Result<Vec<f32>, String> {
         if self.fallback_mode {
             // Return a dummy style vector for fallback mode
             return Ok(vec![0.0; 256]);
@@ -365,7 +376,20 @@ impl TtsEngine {
                 .get(voice_name)
                 .ok_or_else(|| format!("Voice not found: {}", voice_name))?;
 
-            for (i, val) in voice_style.iter().enumerate() {
+            // Kokoro voice files (0.bin) are stored as [max_seq_len, 1, 256]
+            // f32 tables; load_voices flattens that into a single Vec<f32>.
+            // The model needs the row matching the *current* token count, so
+            // pick the [tokens_len*256 .. tokens_len*256+256] slice. The
+            // previous code took [0..256] (style for an empty sentence) for
+            // every input, which is the root cause of the audio dropouts.
+            // Clamp tokens_len to the highest stored row so very long inputs
+            // simply re-use the last available style row.
+            let style_dim: usize = 256;
+            let max_idx = voice_style.len().saturating_sub(style_dim) / style_dim;
+            let idx = tokens_len.min(max_idx);
+            let offset = idx * style_dim;
+            let slice_end = (offset + style_dim).min(voice_style.len());
+            for (i, val) in voice_style[offset..slice_end].iter().enumerate() {
                 if i < result.len() {
                     result[i] += val * weight;
                 }
