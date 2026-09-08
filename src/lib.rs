@@ -13,12 +13,32 @@
 //!     let mut tts = TtsEngine::new().await.unwrap();
 //!
 //!     // Generate speech with synthesize_with_options
-//!     let audio = tts.synthesize_with_options("Hello world!", None, 1.0, 1.0, Some("en")).unwrap();
+//!     let audio = tts.synthesize_with_options("Hello world!", None, 1.0, 1.0, None).unwrap();
 //!
 //!     // Save to file
 //!     tts.save_wav("output.wav", &audio).unwrap();
 //! }
 //! ```
+//!
+//! # Languages
+//!
+//! The voice picks the language: `af_heart` is American English, `zf_xiaoni`
+//! is Mandarin. Callers do not have to say which, and the `lang` argument is
+//! only consulted for voices this crate does not recognize.
+//!
+//! This matters more than it sounds. Kokoro's nine languages were trained
+//! against three different grapheme-to-phoneme front ends, and each speaks a
+//! different phoneme alphabet; feeding one language's phonemes to another
+//! language's voice is what makes a voice sound subtly wrong rather than
+//! obviously broken. [`g2p`] reproduces all three.
+//!
+//! All nine are built in; there is nothing to enable.
+
+mod vocab;
+
+pub mod g2p;
+
+pub use g2p::Lang;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -26,7 +46,6 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use espeak_rs::text_to_phonemes;
 use ndarray::{ArrayBase, IxDyn, OwnedRepr};
 use ndarray_npy::NpzReader;
 use ort::{
@@ -49,14 +68,13 @@ const VOICES_URL: &str = "https://github.com/8b-is/kokoro-tiny/raw/main/models/0
 const SAMPLE_RATE: u32 = 24000; // Kokoro model sample rate
 const DEFAULT_VOICE: &str = "af_sky";
 const DEFAULT_SPEED: f32 = 1.0; // User-facing normal speed (maps to model 0.65)
-const DEFAULT_LANG: &str = "en";
 const SPEED_SCALE: f32 = 0.65; // Model speed = user speed * this scale factor
-const LONG_TEXT_THRESHOLD: usize = 120;
-const MAX_CHARS_PER_CHUNK: usize = 180;
 const CHUNK_CROSSFADE_MS: usize = 45;
 const MIN_ENGINE_SPEED: f32 = 0.35;
 const MAX_ENGINE_SPEED: f32 = 2.2;
-const PAD_TOKEN: char = '$'; // Padding token for beginning/end of phonemes
+/// Longest run of characters we will hand to the model without a place to
+/// break: a fallback for scripts that write without spaces or punctuation.
+const MAX_CHARS_PER_ATOM: usize = 24;
 
 // Fallback audio message - "Excuse me, I lost my voice. Give me time to get it back."
 // This is a pre-generated minimal WAV file that can play while downloading
@@ -79,7 +97,6 @@ fn get_cache_dir() -> PathBuf {
 pub struct TtsEngine {
     session: Option<Arc<Mutex<Session>>>,
     voices: HashMap<String, Vec<f32>>,
-    vocab: HashMap<char, i64>,
     fallback_mode: bool,
 }
 
@@ -155,7 +172,6 @@ impl TtsEngine {
                 return Ok(Self {
                     session: None,
                     voices: HashMap::new(),
-                    vocab: build_vocab(),
                     fallback_mode: true,
                 });
             }
@@ -177,7 +193,6 @@ impl TtsEngine {
         Ok(Self {
             session: Some(Arc::new(Mutex::new(session))),
             voices,
-            vocab: build_vocab(),
             fallback_mode: false,
         })
     }
@@ -192,8 +207,13 @@ impl TtsEngine {
     }
 
     /// Synthesize text to speech with full options
+    ///
     /// Speed: 0.5 = half speed (slower), 1.0 = normal, 2.0 = double speed (faster)
     /// Gain: 0.5 = quieter, 1.0 = normal, 2.0 = twice as loud (with soft clipping)
+    ///
+    /// The language comes from the voice - `af_heart` is American English,
+    /// `zf_xiaoni` is Mandarin - so `lang` is only consulted for voice names
+    /// this crate does not recognize. Pass `None` unless you have such a voice.
     pub fn synthesize_with_options(
         &mut self,
         text: &str,
@@ -208,116 +228,106 @@ impl TtsEngine {
             return wav_to_f32(FALLBACK_MESSAGE);
         }
 
+        let voice = voice.unwrap_or(DEFAULT_VOICE);
+        let lang = self.resolve_lang(voice, lang);
+        let chunks = phonemize_chunks(text, lang)?;
+        if chunks.is_empty() {
+            return Err("No text provided for synthesis".to_string());
+        }
+
+        debug_log!(
+            "📚 {} chars -> {} phoneme chunk(s) [{}]",
+            text.chars().count(),
+            chunks.len(),
+            lang.code()
+        );
+
+        self.synthesize_phoneme_chunks(&chunks, voice, speed, gain)
+    }
+
+    /// The phonemes this engine would synthesize for `text` in `voice`.
+    ///
+    /// Exposed for inspection; synthesis always goes through
+    /// [`Self::synthesize_with_options`], which does this step itself.
+    pub fn phonemize(&self, text: &str, voice: Option<&str>) -> Result<String, String> {
+        let voice = voice.unwrap_or(DEFAULT_VOICE);
+        g2p::phonemize(text, self.resolve_lang(voice, None))
+    }
+
+    /// Which language a request is in: the voice knows, so it wins.
+    fn resolve_lang(&self, voice: &str, lang: Option<&str>) -> Lang {
+        Lang::from_voice(voice)
+            .or_else(|| lang.and_then(Lang::from_name))
+            .unwrap_or(Lang::AmericanEnglish)
+    }
+
+    fn synthesize_phoneme_chunks(
+        &self,
+        chunks: &[String],
+        voice: &str,
+        speed: f32,
+        gain: f32,
+    ) -> Result<Vec<f32>, String> {
         let session = self
             .session
             .as_ref()
             .ok_or_else(|| "TTS engine not initialized".to_string())?;
 
         // Map user-facing speed to model speed (user 1.0 = model 0.65)
-        let model_speed = speed * SPEED_SCALE;
-        let clamped_speed = model_speed.clamp(MIN_ENGINE_SPEED, MAX_ENGINE_SPEED);
-        let voice = voice.unwrap_or(DEFAULT_VOICE);
-
-        // Voice style is parsed *inside* synthesize_segment after tokenization,
-        // because Kokoro voice arrays are [max_seq_len, 1, 256] tables indexed
-        // by token count. Looking up the row up here would always return the
-        // style for the empty (0-token) sequence — see fix history.
-
-        // Short form: synthesize in one pass for predictable cadence
-        if !needs_chunking(text) {
-            let mut audio = self.synthesize_segment(session, voice, text, clamped_speed, lang)?;
-            if gain != 1.0 {
-                audio = amplify_audio(&audio, gain);
-            }
-            return Ok(audio);
-        }
-
-        // Long-form synthesis path - chunk the text while preserving pacing
-        let prepared_chunks: Vec<String> = split_text_for_tts(text, MAX_CHARS_PER_CHUNK)
-            .into_iter()
-            .filter(|chunk| !chunk.trim().is_empty())
-            .collect();
-
-        if prepared_chunks.is_empty() {
-            return Err("No text provided for synthesis".to_string());
-        }
-
-        let chunk_count = prepared_chunks.len();
-        debug_log!(
-            "📚 Long-form synthesis enabled: {} chars -> {} chunk(s) (≤ {} chars each)",
-            text.chars().count(),
-            chunk_count,
-            MAX_CHARS_PER_CHUNK
-        );
-
+        let clamped_speed = (speed * SPEED_SCALE).clamp(MIN_ENGINE_SPEED, MAX_ENGINE_SPEED);
         let overlap = chunk_crossfade_samples();
-        let mut combined_audio = Vec::new();
+        let mut combined = Vec::new();
 
-        for (idx, chunk) in prepared_chunks.iter().enumerate() {
+        for (idx, chunk) in chunks.iter().enumerate() {
             debug_log!(
-                "   → Chunk {}/{} ({} chars)",
+                "   → Chunk {}/{} ({} phonemes)",
                 idx + 1,
-                chunk_count,
-                chunk.chars().count()
+                chunks.len(),
+                vocab::phoneme_count(chunk)
             );
-
-            let chunk_audio =
-                self.synthesize_segment(session, voice, chunk, clamped_speed, lang)?;
-            append_with_crossfade(&mut combined_audio, &chunk_audio, overlap);
+            let audio = self.synthesize_segment(session, voice, chunk, clamped_speed)?;
+            append_with_crossfade(&mut combined, &audio, overlap);
         }
 
-        if combined_audio.is_empty() {
+        if combined.is_empty() {
             return Err("Failed to synthesize combined audio".to_string());
         }
-
-        let mut final_audio = combined_audio;
         if gain != 1.0 {
-            final_audio = amplify_audio(&final_audio, gain);
+            combined = amplify_audio(&combined, gain);
         }
-
-        Ok(final_audio)
+        Ok(combined)
     }
 
     fn synthesize_segment(
         &self,
         session: &Arc<Mutex<Session>>,
         voice: &str,
-        text: &str,
+        phonemes: &str,
         speed: f32,
-        lang: Option<&str>,
     ) -> Result<Vec<f32>, String> {
-        // Convert text to phonemes
-        let phonemes = text_to_phonemes(text, lang.unwrap_or(DEFAULT_LANG), None, true, false)
-            .map_err(|e| format!("Failed to convert text to phonemes: {}", e))?;
-
-        // Join phonemes with spaces and pad with a single BOS/EOS token at each
-        // end. The Kokoro 82M model is trained against one boundary pad token
-        // per side; the previous "$$$" (three pads) pushed the input out of
-        // distribution and inflated the duration predictor at the boundaries.
-        // Matches upstream Kokoros (lucasjinreal/Kokoros)'s `vec![0]` pattern.
-        let mut phonemes_text = phonemes.join(" ");
-        phonemes_text.insert_str(0, "$");
-        phonemes_text.push_str("$");
-
-        // Debug output only for long text
-        if text.len() > 50 {
-            debug_log!("   Text length: {} chars", text.len());
-            debug_log!("   Phonemes array: {} entries", phonemes.len());
-            debug_log!("   Phoneme text length: {} chars", phonemes_text.len());
+        let count = vocab::phoneme_count(phonemes);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // The model's positional embeddings stop at `context_length`; past it
+        // ONNX Runtime fails deep inside the encoder with a shape error that
+        // tells the caller nothing. Chunking upstream should mean we never get
+        // here, so say plainly what happened rather than let it through.
+        if count > vocab::MAX_PHONEMES {
+            return Err(format!(
+                "segment is {} phonemes, model limit is {}",
+                count,
+                vocab::MAX_PHONEMES
+            ));
         }
 
-        let tokens = self.tokenize(phonemes_text);
+        let tokens = vocab::tokenize(phonemes);
 
-        // Per-segment style lookup: kokoro voice files are [max_seq_len, 1, 256]
-        // tables, and the model expects the row that matches the current token
-        // count (matches upstream Kokoros's `mix_styles(name, tokens.len())`).
-        // The previous code computed style up in synthesize_with_options before
-        // tokenisation and would therefore always feed style[0] (the empty-
-        // sequence embedding) regardless of the input — the root cause of the
-        // audible "first ~1s clear, rest is murmurs / silence" dropout.
-        let style = self.parse_voice_style(voice, tokens.len())?;
+        // Kokoro voice files are [max_seq_len, 1, 256] tables and the model
+        // wants the row matching this utterance's length, indexed by phoneme
+        // count excluding the boundary tokens (reference: `pack[len(ps)-1]`).
+        let style = self.parse_voice_style(voice, count.saturating_sub(1))?;
 
-        // Run inference with user-specified speed directly
         self.run_inference(session, tokens, style, speed)
     }
 
@@ -348,7 +358,7 @@ impl TtsEngine {
 
     // Private helper methods
 
-    fn parse_voice_style(&self, voice_str: &str, tokens_len: usize) -> Result<Vec<f32>, String> {
+    fn parse_voice_style(&self, voice_str: &str, style_row: usize) -> Result<Vec<f32>, String> {
         if self.fallback_mode {
             // Return a dummy style vector for fallback mode
             return Ok(vec![0.0; 256]);
@@ -378,15 +388,14 @@ impl TtsEngine {
 
             // Kokoro voice files (0.bin) are stored as [max_seq_len, 1, 256]
             // f32 tables; load_voices flattens that into a single Vec<f32>.
-            // The model needs the row matching the *current* token count, so
-            // pick the [tokens_len*256 .. tokens_len*256+256] slice. The
-            // previous code took [0..256] (style for an empty sentence) for
-            // every input, which is the root cause of the audio dropouts.
-            // Clamp tokens_len to the highest stored row so very long inputs
-            // simply re-use the last available style row.
+            // The model needs the row matching this utterance's length, so
+            // pick the [style_row*256 .. style_row*256+256] slice. Taking
+            // [0..256] - the style for an empty sentence - for every input is
+            // what caused the "first second is clear, the rest is murmurs"
+            // dropout. Clamp so very long inputs re-use the last stored row.
             let style_dim: usize = 256;
             let max_idx = voice_style.len().saturating_sub(style_dim) / style_dim;
-            let idx = tokens_len.min(max_idx);
+            let idx = style_row.min(max_idx);
             let offset = idx * style_dim;
             let slice_end = (offset + style_dim).min(voice_style.len());
             for (i, val) in voice_style[offset..slice_end].iter().enumerate() {
@@ -397,12 +406,6 @@ impl TtsEngine {
         }
 
         Ok(result)
-    }
-
-    fn tokenize(&self, text: String) -> Vec<i64> {
-        text.chars()
-            .map(|c| *self.vocab.get(&c).unwrap_or(&0))
-            .collect()
     }
 
     fn run_inference(
@@ -478,22 +481,6 @@ impl TtsEngine {
 
 // Helper functions
 
-// Build proper vocabulary for tokenization (matching original Kokoros)
-fn build_vocab() -> HashMap<char, i64> {
-    let pad = "$";
-    let punctuation = r#";:,.!?¡¿—…"«»"" "#;
-    let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ";
-
-    let symbols: String = [pad, punctuation, letters, letters_ipa].concat();
-
-    symbols
-        .chars()
-        .enumerate()
-        .map(|(idx, c)| (c, idx as i64))
-        .collect()
-}
-
 // Load voices from binary file
 fn load_voices(path: &str) -> Result<HashMap<String, Vec<f32>>, String> {
     let mut file = File::open(path).map_err(|e| format!("Failed to open voices file: {}", e))?;
@@ -545,10 +532,6 @@ fn wav_to_f32(wav_bytes: &[u8]) -> Result<Vec<f32>, String> {
     samples.map_err(|e| format!("Failed to read samples: {}", e))
 }
 
-fn needs_chunking(text: &str) -> bool {
-    text.chars().count() > LONG_TEXT_THRESHOLD || text.lines().count() > 3
-}
-
 fn chunk_crossfade_samples() -> usize {
     ((SAMPLE_RATE as usize) * CHUNK_CROSSFADE_MS) / 1000
 }
@@ -579,100 +562,135 @@ fn append_with_crossfade(buffer: &mut Vec<f32>, next: &[f32], overlap_samples: u
     buffer.extend_from_slice(&next[overlap..]);
 }
 
-// Split text into chunks for better synthesis
-// Kokoro model handles shorter text better without dropping words
-fn split_text_for_tts(text: &str, max_chars: usize) -> Vec<String> {
-    // First try to split by sentences
-    let sentences: Vec<&str> = text
-        .split_terminator(&['.', '!', '?'][..])
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+// --- chunking --------------------------------------------------------------
+//
+// The model takes at most `vocab::MAX_PHONEMES` per pass, so long input has to
+// be broken up. Splitting on a character budget - as this crate used to - is
+// wrong twice over: how many phonemes a character becomes varies by an order
+// of magnitude between languages, and the split points themselves (ASCII `.`
+// and whitespace) do not exist in Chinese or Japanese text, so CJK input was
+// never split at all and simply failed in the ONNX session.
+//
+// Instead: split on real sentence boundaries in any script, phonemize, and
+// pack the results back up to the budget.
 
-    let mut chunks = Vec::new();
-    let mut current_chunk = String::new();
-
-    for sentence in sentences {
-        // Add back the punctuation if it was there
-        let full_sentence = if text.contains(&format!("{}.", sentence.trim())) {
-            format!("{}.", sentence.trim())
-        } else if text.contains(&format!("{}!", sentence.trim())) {
-            format!("{}!", sentence.trim())
-        } else if text.contains(&format!("{}?", sentence.trim())) {
-            format!("{}?", sentence.trim())
-        } else {
-            sentence.trim().to_string()
-        };
-
-        // If this sentence alone is too long, split it by commas or words
-        if full_sentence.len() > max_chars {
-            // Try splitting by commas first
-            let parts: Vec<&str> = full_sentence.split(',').collect();
-            if parts.len() > 1 {
-                for part in parts {
-                    if part.trim().len() > max_chars {
-                        // Still too long, split by words
-                        chunks.extend(split_by_words(part, max_chars));
-                    } else if !part.trim().is_empty() {
-                        chunks.push(part.trim().to_string());
-                    }
-                }
-            } else {
-                // No commas, split by words
-                chunks.extend(split_by_words(&full_sentence, max_chars));
-            }
-        }
-        // If adding this sentence would make chunk too long, save current and start new
-        else if !current_chunk.is_empty()
-            && current_chunk.len() + full_sentence.len() + 1 > max_chars
-        {
-            chunks.push(current_chunk.trim().to_string());
-            current_chunk = full_sentence;
-        }
-        // Add to current chunk
-        else {
-            if !current_chunk.is_empty() {
-                current_chunk.push(' ');
-            }
-            current_chunk.push_str(&full_sentence);
-        }
-    }
-
-    // Don't forget the last chunk
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk.trim().to_string());
-    }
-
-    // If no chunks were created (text had no sentence endings), split by words
-    if chunks.is_empty() && !text.trim().is_empty() {
-        chunks = split_by_words(text, max_chars);
-    }
-
-    chunks
+/// Sentence-ending punctuation, in every script the model supports.
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}' | '\u{2026}')
 }
 
-// Split text by words when sentences are too long
-fn split_by_words(text: &str, max_chars: usize) -> Vec<String> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut chunks = Vec::new();
-    let mut current = String::new();
+/// Clause-separating punctuation, likewise.
+fn is_clause_end(c: char) -> bool {
+    matches!(c, ',' | ';' | ':' | '\u{ff0c}' | '\u{3001}' | '\u{ff1b}' | '\u{ff1a}' | '\u{2014}')
+}
 
-    for word in words {
-        if current.len() + word.len() + 1 > max_chars && !current.is_empty() {
-            chunks.push(current.trim().to_string());
-            current = word.to_string();
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
+/// Split after each character matching `at`, keeping it with its sentence.
+fn split_keeping(text: &str, at: fn(char) -> bool) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        current.push(c);
+        if at(c) && !current.trim().is_empty() {
+            parts.push(std::mem::take(&mut current));
         }
     }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
 
-    if !current.is_empty() {
-        chunks.push(current.trim().to_string());
+/// Last-resort split for text with no punctuation and no spaces.
+fn split_atoms(text: &str) -> Vec<String> {
+    if text.split_whitespace().count() > 1 {
+        return text.split_whitespace().map(str::to_string).collect();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(MAX_CHARS_PER_ATOM)
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
+/// Append `phonemes` to `chunks`, merging into the previous chunk while it
+/// still fits so short sentences share one pass and keep their pacing.
+fn push_packed(chunks: &mut Vec<String>, phonemes: String) {
+    if phonemes.trim().is_empty() {
+        return;
+    }
+    if let Some(last) = chunks.last_mut() {
+        if vocab::phoneme_count(last) + 1 + vocab::phoneme_count(&phonemes)
+            <= vocab::MAX_PHONEMES
+        {
+            last.push(' ');
+            last.push_str(phonemes.trim());
+            return;
+        }
+    }
+    chunks.push(phonemes.trim().to_string());
+}
+
+/// Text -> phoneme chunks, each within the model's context length.
+fn phonemize_chunks(text: &str, lang: Lang) -> Result<Vec<String>, String> {
+    let mut chunks = Vec::new();
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        add_phonemized(line, lang, 0, &mut chunks)?;
+    }
+    Ok(chunks)
+}
+
+fn add_phonemized(
+    text: &str,
+    lang: Lang,
+    depth: usize,
+    chunks: &mut Vec<String>,
+) -> Result<(), String> {
+    let phonemes = g2p::phonemize(text, lang)?;
+    if vocab::phoneme_count(&phonemes) <= vocab::MAX_PHONEMES {
+        push_packed(chunks, phonemes);
+        return Ok(());
     }
 
-    chunks
+    // Try progressively finer split points, taking the first that actually
+    // divides the text. Falling straight through to a truncation when the
+    // coarsest one finds nothing would lose the tail of any long single
+    // sentence - text with commas but no full stop is entirely ordinary.
+    let splitters: [fn(&str) -> Vec<String>; 3] = [
+        |t| split_keeping(t, is_sentence_end),
+        |t| split_keeping(t, is_clause_end),
+        split_atoms,
+    ];
+    let parts = splitters
+        .iter()
+        .skip(depth)
+        .map(|split| split(text))
+        .find(|parts| parts.len() > 1)
+        .unwrap_or_default();
+
+    // No split point left at any granularity: keep what fits rather than
+    // failing the whole utterance, and say so when debugging is on.
+    if parts.len() < 2 {
+        debug_log!(
+            "   ⚠️  {} phonemes with nowhere to split; truncating to {}",
+            vocab::phoneme_count(&phonemes),
+            vocab::MAX_PHONEMES
+        );
+        let truncated: String = phonemes.chars().take(vocab::MAX_PHONEMES).collect();
+        push_packed(chunks, truncated);
+        return Ok(());
+    }
+
+    for part in parts {
+        add_phonemized(&part, lang, depth + 1, chunks)?;
+    }
+    Ok(())
 }
 
 // Amplify audio - allows some clipping for maximum loudness
@@ -705,12 +723,54 @@ mod tests {
     }
 
     #[test]
-    fn detects_need_for_chunking() {
-        let short = "hello world";
-        assert!(!needs_chunking(short));
+    fn short_text_stays_in_one_chunk() {
+        let chunks = phonemize_chunks("Hello world.", Lang::AmericanEnglish).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(vocab::phoneme_count(&chunks[0]) <= vocab::MAX_PHONEMES);
+    }
 
-        let long = "This sentence is intentionally quite a bit longer than the \
-                    short sample so that it exceeds the chunking threshold we set.";
-        assert!(needs_chunking(long));
+    #[test]
+    fn every_chunk_fits_the_model_context() {
+        let long = "This sentence is deliberately repetitive. ".repeat(80);
+        let chunks = phonemize_chunks(&long, Lang::AmericanEnglish).unwrap();
+        assert!(chunks.len() > 1, "long input should be split");
+        for chunk in &chunks {
+            assert!(
+                vocab::phoneme_count(chunk) <= vocab::MAX_PHONEMES,
+                "chunk of {} phonemes exceeds the {} limit",
+                vocab::phoneme_count(chunk),
+                vocab::MAX_PHONEMES
+            );
+        }
+    }
+
+    #[test]
+    fn splits_on_sentence_boundaries_in_any_script() {
+        assert_eq!(split_keeping("A. B. C.", is_sentence_end).len(), 3);
+        // No ASCII punctuation and no spaces: the old chunker never split this.
+        let zh = split_keeping("\u{4f60}\u{597d}\u{3002}\u{4e16}\u{754c}\u{3002}", is_sentence_end);
+        assert_eq!(zh.len(), 2, "{zh:?}");
+    }
+
+    #[test]
+    fn a_long_sentence_with_no_full_stop_is_not_truncated() {
+        // Commas but no sentence terminator: the coarsest splitter finds
+        // nothing, and we must fall through to the finer ones rather than
+        // throwing the tail away.
+        let long = "one thing, and another thing, ".repeat(60);
+        let chunks = phonemize_chunks(&long, Lang::AmericanEnglish).unwrap();
+        let kept: usize = chunks.iter().map(|c| vocab::phoneme_count(c)).sum();
+        let whole = vocab::phoneme_count(&g2p::phonemize(&long, Lang::AmericanEnglish).unwrap());
+        assert!(chunks.len() > 1, "should have been split");
+        assert!(
+            kept as f32 > whole as f32 * 0.95,
+            "kept {kept} of {whole} phonemes - the tail was dropped"
+        );
+    }
+
+    #[test]
+    fn text_without_any_break_still_gets_split() {
+        let runon = "a".repeat(500);
+        assert!(split_atoms(&runon).len() > 1);
     }
 }

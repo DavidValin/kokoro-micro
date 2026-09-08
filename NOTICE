@@ -1,0 +1,57 @@
+kokoro-micro
+Copyright 2025-2026 The kokoro-micro authors
+
+This product includes software developed by others, as listed below. Each is
+used under its own licence; those licences are not superseded by the Apache
+License, Version 2.0 that covers this project as a whole.
+
+--------------------------------------------------------------------------------
+misaki - https://github.com/hexgrad/misaki
+Licensed under the Apache License, Version 2.0.
+
+The grapheme-to-phoneme layer in src/g2p/ is a Rust port of misaki, Kokoro's
+own G2P:
+
+  * src/g2p/espeak.rs        ports the rewrite tables in misaki/espeak.py
+                             (EspeakG2P and EspeakFallback).
+  * tools/gen_zh_data.py     ports the pinyin-to-IPA tables in
+                             misaki/transcription.py, which generate
+                             src/g2p/zh_syllables.rs.
+  * src/g2p/zh.rs            follows the algorithm of ZHG2P.legacy_call in
+                             misaki/zh.py.
+  * tools/gen_ja_data.py     extracts the HEPBURN table from misaki/cutlet.py,
+                             which generates src/g2p/ja_data.rs.
+  * src/g2p/ja.rs            follows the algorithm of Cutlet._get_single_mapping
+                             in misaki/cutlet.py.
+
+--------------------------------------------------------------------------------
+pinyin-to-ipa - https://github.com/stefantaubert/pinyin-to-ipa
+Licensed under the MIT License.
+
+misaki/transcription.py, ported here in tools/gen_zh_data.py, is itself adapted
+from this project.
+
+--------------------------------------------------------------------------------
+cutlet - https://github.com/polm/cutlet
+Licensed under the MIT License.
+
+misaki/cutlet.py, the source of the kana table in src/g2p/ja_data.rs and of the
+mora-mapping algorithm in src/g2p/ja.rs, is adapted from this project.
+
+--------------------------------------------------------------------------------
+python-pinyin - https://github.com/mozillazg/python-pinyin
+Licensed under the MIT License.
+
+  * src/g2p/zh_phrases.txt   is generated from this project's phrase dictionary
+                             (pypinyin/phrases_dict.json).
+  * tools/gen_zh_data.py     ports the strict initial/final analysis in
+                             pypinyin/standard.py and pypinyin/style/_utils.py.
+
+--------------------------------------------------------------------------------
+Kokoro-82M - https://huggingface.co/hexgrad/Kokoro-82M
+Licensed under the Apache License, Version 2.0.
+
+  * src/vocab.rs             contains the phoneme vocabulary from the model's
+                             config.json.
+  * tools/kokoro_vocab.json  is a copy of that vocabulary, used to validate the
+                             generated tables.

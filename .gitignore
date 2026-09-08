@@ -25,3 +25,9 @@ voices-v1.0.bin
 !assets/**
 /docs-confie
 .worktrees/
+
+# Third-party inputs for tools/gen_*_data.py. Downloaded on demand; the
+# generated tables under src/g2p/ are what gets committed.
+/tools/phrases_dict.json
+/tools/pinyin_dict.json
+/tools/cutlet.py

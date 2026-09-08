@@ -21,8 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = "Hello from kokoro-micro! This is a minimal text to speech engine.";
     println!("Synthesizing: \"{}\"\n", text);
 
-    // Use synthesize_with_options: text, voice, speed, gain, lang
-    let audio = tts.synthesize_with_options(text, None, 1.0, 1.0, Some("en"))?;
+    // text, voice, speed, gain, lang. `lang` is None because the voice
+    // already says which language it speaks - see examples/phonemes.rs.
+    let audio = tts.synthesize_with_options(text, None, 1.0, 1.0, None)?;
     println!("✅ Generated {} audio samples", audio.len());
 
     // Save to file
