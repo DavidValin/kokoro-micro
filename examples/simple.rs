@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize TTS engine
-    let mut tts = TtsEngine::new().await?;
+    let tts = TtsEngine::new().await?;
 
     // Simple text synthesis
     let text = "Hello from kokoro-micro! This is a minimal text to speech engine.";

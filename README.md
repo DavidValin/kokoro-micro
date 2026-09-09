@@ -74,7 +74,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kokoro-micro = "1.1"
+kokoro-micro = "1.2"
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 
@@ -229,12 +229,42 @@ KOKORO_DEBUG=1 cargo run --example simple
 
 ### Optional Features
 
-- **`cuda`** - Enable CUDA acceleration for ONNX Runtime
+- **`cuda`** - build with ONNX Runtime's CUDA execution provider
 
 ```toml
 [dependencies]
-kokoro-micro = { version = "1.1", features = ["cuda"] }
+kokoro-micro = { version = "1.2", features = ["cuda"] }
 ```
+
+### Choosing a device
+
+Without the `cuda` feature the model runs on the CPU and nothing below
+changes anything. With it, `TtsEngine::new()` runs on the GPU when the CUDA
+provider comes up and on the CPU when it does not - a failed provider
+registration is not an error, and neither is a provider that will not take
+the model. To ask for something else, or to be told when the GPU is not there
+instead of quietly losing the speedup:
+
+```rust
+use kokoro_micro::{Device, TtsEngine};
+
+// `Device::Gpu` fails if CUDA is not compiled in or will not initialize.
+// `Device::Auto` (the default) falls back to the CPU instead.
+let tts = TtsEngine::new_on_device(Device::Gpu).await?;
+println!("running on {}", tts.backend()); // CUDAExecutionProvider (device 0)
+```
+
+`Device::parse` accepts `auto`, `cpu`, `gpu` and `gpu:<index>` (with `cuda`
+and `cuda:<index>` as aliases), for a `--device` flag or a config file.
+`TtsEngine::on_device(model_path, voices_path, device)` is the same thing with
+custom model paths.
+
+A card that fills up mid-session fails at inference time, not at load time.
+`synthesize_with_options` handles that itself: when a run fails on a GPU it
+rebuilds the session on the CPU and retries the utterance once, so the
+sentence still comes out and later calls go straight to the CPU.
+`TtsEngine::fallback_to_cpu()` and `TtsEngine::reload_on_device(device)` do
+the same move on demand.
 
 ## Model Files
 

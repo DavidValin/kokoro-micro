@@ -6,7 +6,7 @@ use kokoro_micro::TtsEngine;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut tts = TtsEngine::new().await.expect("engine");
+    let tts = TtsEngine::new().await.expect("engine");
 
     let cases: &[(&str, &str, &str)] = &[
         ("digits, en", "af_heart", "I paid 1,234 dollars on 3 May 2025."),

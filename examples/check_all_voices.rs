@@ -26,7 +26,7 @@ fn sample(lang: Lang) -> &'static str {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut tts = TtsEngine::new().await.expect("engine");
+    let tts = TtsEngine::new().await.expect("engine");
     let mut voices = tts.voices();
     voices.sort();
 

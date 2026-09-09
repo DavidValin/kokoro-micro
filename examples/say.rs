@@ -22,7 +22,7 @@ async fn main() {
     };
     let out = args.next().unwrap_or_else(|| "/tmp/say.wav".to_string());
 
-    let mut tts = TtsEngine::new().await.expect("engine");
+    let tts = TtsEngine::new().await.expect("engine");
 
     match Lang::from_voice(&voice) {
         Some(lang) => println!("voice {voice}, language {}", lang.code()),

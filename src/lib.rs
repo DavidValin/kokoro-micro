@@ -10,7 +10,7 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     // Initialize with auto-download of model if needed
-//!     let mut tts = TtsEngine::new().await.unwrap();
+//!     let tts = TtsEngine::new().await.unwrap();
 //!
 //!     // Generate speech with synthesize_with_options
 //!     let audio = tts.synthesize_with_options("Hello world!", None, 1.0, 1.0, None).unwrap();
@@ -33,11 +33,21 @@
 //! obviously broken. [`g2p`] reproduces all three.
 //!
 //! All nine are built in; there is nothing to enable.
+//!
+//! # Where it runs
+//!
+//! On the CPU, unless the crate is built with `--features cuda` and ONNX
+//! Runtime's CUDA provider initializes, in which case [`TtsEngine::new`] uses
+//! it. [`Device`] chooses explicitly - including requiring a GPU rather than
+//! falling back to the CPU - and [`TtsEngine::backend`] reports what was
+//! chosen. See [`TtsEngine::on_device`] and [`TtsEngine::fallback_to_cpu`].
 
 mod vocab;
 
+pub mod device;
 pub mod g2p;
 
+pub use device::{compiled_gpu_providers, gpu_support_compiled, Backend, Device};
 pub use g2p::Lang;
 
 use std::collections::HashMap;
@@ -49,7 +59,7 @@ use std::sync::{Arc, Mutex};
 use ndarray::{ArrayBase, IxDyn, OwnedRepr};
 use ndarray_npy::NpzReader;
 use ort::{
-    session::{builder::GraphOptimizationLevel, Session, SessionInputValue, SessionInputs},
+    session::{Session, SessionInputValue, SessionInputs},
     value::{Tensor, Value},
 };
 
@@ -71,6 +81,9 @@ const DEFAULT_SPEED: f32 = 1.0; // User-facing normal speed (maps to model 0.65)
 const SPEED_SCALE: f32 = 0.65; // Model speed = user speed * this scale factor
 const CHUNK_CROSSFADE_MS: usize = 45;
 const MIN_ENGINE_SPEED: f32 = 0.35;
+/// Prefix on errors raised by the ONNX session itself, as opposed to ones the
+/// same call would raise on any device. Only these are retried elsewhere.
+const INFERENCE_FAILED_ON: &str = "inference failed on ";
 const MAX_ENGINE_SPEED: f32 = 2.2;
 /// Longest run of characters we will hand to the model without a place to
 /// break: a fallback for scripts that write without spaces or punctuation.
@@ -93,11 +106,26 @@ fn get_cache_dir() -> PathBuf {
     Path::new(&home).join(".cache").join("k")
 }
 
+/// Take a lock, ignoring poisoning: every one of these guards a plain field
+/// swap, so a panic elsewhere leaves nothing half-written to protect against.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Main TTS engine struct
 pub struct TtsEngine {
-    session: Option<Arc<Mutex<Session>>>,
+    /// Behind a lock because the engine can move between devices while it is
+    /// shared: synthesis clones the inner handle and lets go of the outer one,
+    /// so a reload swaps the session without disturbing a run already under
+    /// way - that one finishes on the old session, which the clone keeps alive.
+    session: Mutex<Option<Arc<Mutex<Session>>>>,
     voices: HashMap<String, Vec<f32>>,
     fallback_mode: bool,
+    /// Execution provider the loaded session runs on; the CPU in fallback mode.
+    backend: Mutex<Backend>,
+    /// Where the model came from, so the session can be rebuilt on another
+    /// device without the caller having to remember the path.
+    model_path: PathBuf,
 }
 
 impl TtsEngine {
@@ -107,19 +135,51 @@ impl TtsEngine {
     /// - Linux/macOS: `$HOME/.cache/k/` (e.g., `/home/user/.cache/k/`)
     /// - Windows: `%USERPROFILE%/.cache/k/` (e.g., `C:\Users\Username\.cache\k\`)
     pub async fn new() -> Result<Self, String> {
+        Self::new_on_device(Device::Auto).await
+    }
+
+    /// Same as [`Self::new`] with an explicit [`Device`].
+    pub async fn new_on_device(device: Device) -> Result<Self, String> {
         let cache_dir = get_cache_dir();
         let model_path = cache_dir.join("0.onnx");
         let voices_path = cache_dir.join("0.bin");
 
-        Self::with_paths(
+        Self::on_device(
             model_path.to_str().unwrap_or("0.onnx"),
             voices_path.to_str().unwrap_or("0.bin"),
+            device,
         )
         .await
     }
 
     /// Create a new TTS engine with custom model paths
     pub async fn with_paths(model_path: &str, voices_path: &str) -> Result<Self, String> {
+        Self::on_device(model_path, voices_path, Device::Auto).await
+    }
+
+    /// Create a new TTS engine with custom model paths, on an explicit
+    /// [`Device`].
+    ///
+    /// [`Device::Auto`] - the default everywhere else - runs on the GPU when
+    /// this crate was built with `--features cuda` and the provider comes up,
+    /// and on the CPU otherwise; it never fails because of the GPU.
+    /// [`Device::Gpu`] and [`Device::GpuIndex`] fail instead of falling back,
+    /// for callers who would rather hear about a broken CUDA install than
+    /// quietly run 20x slower. [`Self::backend`] reports what was chosen.
+    ///
+    /// The device is resolved before anything is downloaded, so an impossible
+    /// request comes back immediately rather than after 337MB.
+    pub async fn on_device(
+        model_path: &str,
+        voices_path: &str,
+        device: Device,
+    ) -> Result<Self, String> {
+        // Cheap and early: a GPU asked of a build that has none is hopeless
+        // whatever the machine holds, and saying so now beats saying it after
+        // a 337MB download. Which provider actually gets the model is settled
+        // once, by load_session below.
+        device::check_device(device)?;
+
         // Ensure cache directory exists
         if let Some(parent) = Path::new(model_path).parent() {
             fs::create_dir_all(parent)
@@ -170,31 +230,86 @@ impl TtsEngine {
                 debug_log!("\n💡 Please manually download the model files to ~/.cache/k/");
 
                 return Ok(Self {
-                    session: None,
+                    session: Mutex::new(None),
                     voices: HashMap::new(),
                     fallback_mode: true,
+                    backend: Mutex::new(Backend::cpu()),
+                    model_path: PathBuf::from(model_path),
                 });
             }
         }
 
         // Load ONNX model
-        let model_bytes =
-            std::fs::read(model_path).map_err(|e| format!("Failed to read model file: {}", e))?;
-        let session = Session::builder()
-            .map_err(|e| format!("Failed to create session builder: {}", e))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| format!("Failed to set optimization level: {}", e))?
-            .commit_from_memory(&model_bytes)
-            .map_err(|e| format!("Failed to load model: {}", e))?;
+        let (session, backend) = device::load_session(model_path, device)?;
+        debug_log!("🧠 Model loaded on {}", backend);
 
         // Load voices
         let voices = load_voices(voices_path)?;
 
         Ok(Self {
-            session: Some(Arc::new(Mutex::new(session))),
+            session: Mutex::new(Some(Arc::new(Mutex::new(session)))),
             voices,
             fallback_mode: false,
+            backend: Mutex::new(backend),
+            model_path: PathBuf::from(model_path),
         })
+    }
+
+    /// The execution provider this engine runs on: `CPU`, or
+    /// `CUDAExecutionProvider` and the device index. Cloned rather than
+    /// borrowed because it changes when the engine moves devices.
+    pub fn backend(&self) -> Backend {
+        lock(&self.backend).clone()
+    }
+
+    /// Rebuild the session on another [`Device`], keeping the loaded voices.
+    ///
+    /// Load-time device selection cannot cover the case that matters most in
+    /// a long-lived process: a card that fills up - or is taken away - while
+    /// the engine is alive. Inference then fails at run time, and the only
+    /// way back is a new session. The old one is dropped first so its VRAM is
+    /// released before the new one asks for any, which also means a failed
+    /// reload leaves the engine without a session: call it again.
+    ///
+    /// Takes `&self`: the engine is normally shared, and demanding `&mut` for
+    /// something that happens once would push a lock onto every caller.
+    pub fn reload_on_device(&self, device: Device) -> Result<(), String> {
+        if self.fallback_mode {
+            return Err("TTS engine is in fallback mode; there is no model to reload".to_string());
+        }
+        device::check_device(device)?;
+        // Only the CPU can be recognised as "already there" without loading:
+        // which GPU provider a device resolves to is decided by the load.
+        if !device.wants_gpu() && !lock(&self.backend).is_gpu() && lock(&self.session).is_some() {
+            return Ok(());
+        }
+
+        // Drop the old session before building the new one: when the reload
+        // is happening because the card filled up, that VRAM has to come back
+        // before the new session asks for any. A synthesis already running
+        // holds its own handle and finishes on the old session.
+        *lock(&self.session) = None;
+
+        // On failure the engine is left without a session and `backend` still
+        // names the device the dropped one ran on - another reload is the only
+        // way back either way.
+        let (session, backend) = device::load_session(&self.model_path, device)?;
+        debug_log!("🔁 Model reloaded on {}", backend);
+        *lock(&self.session) = Some(Arc::new(Mutex::new(session)));
+        *lock(&self.backend) = backend;
+        Ok(())
+    }
+
+    /// Rebuild the session on the CPU. A no-op when it already runs there.
+    ///
+    /// [`Self::synthesize_with_options`] calls this itself when inference
+    /// fails on a GPU, so most callers never need it; reach for it directly
+    /// to give the card back before some other process needs it.
+    pub fn fallback_to_cpu(&self) -> Result<(), String> {
+        if !lock(&self.backend).is_gpu() {
+            return Ok(());
+        }
+        self.reload_on_device(Device::Cpu)
     }
 
     /// List all available voices
@@ -215,7 +330,7 @@ impl TtsEngine {
     /// `zf_xiaoni` is Mandarin - so `lang` is only consulted for voice names
     /// this crate does not recognize. Pass `None` unless you have such a voice.
     pub fn synthesize_with_options(
-        &mut self,
+        &self,
         text: &str,
         voice: Option<&str>,
         speed: f32,
@@ -242,7 +357,21 @@ impl TtsEngine {
             lang.code()
         );
 
-        self.synthesize_phoneme_chunks(&chunks, voice, speed, gain)
+        // Read before the match rather than in its guard: the arm below takes
+        // the same lock again, and std mutexes are not reentrant.
+        let on_gpu = self.backend().is_gpu();
+        match self.synthesize_phoneme_chunks(&chunks, voice, speed, gain) {
+            Err(e) if on_gpu && e.starts_with(INFERENCE_FAILED_ON) => {
+                // A GPU that runs out of memory mid-session fails here, not at
+                // load time. Rebuild on the CPU and say the sentence rather
+                // than lose it; every later call goes to the CPU too.
+                debug_log!("⚠️  {} - falling back to CPU", e);
+                self.fallback_to_cpu()
+                    .map_err(|rebuild| format!("{} (CPU fallback also failed: {})", e, rebuild))?;
+                self.synthesize_phoneme_chunks(&chunks, voice, speed, gain)
+            }
+            result => result,
+        }
     }
 
     /// The phonemes this engine would synthesize for `text` in `voice`.
@@ -268,9 +397,11 @@ impl TtsEngine {
         speed: f32,
         gain: f32,
     ) -> Result<Vec<f32>, String> {
-        let session = self
-            .session
+        // Cloned out of the lock so inference does not hold it: a reload can
+        // then swap the session while this run finishes on the old one.
+        let session = lock(&self.session)
             .as_ref()
+            .cloned()
             .ok_or_else(|| "TTS engine not initialized".to_string())?;
 
         // Map user-facing speed to model speed (user 1.0 = model 0.65)
@@ -285,7 +416,7 @@ impl TtsEngine {
                 chunks.len(),
                 vocab::phoneme_count(chunk)
             );
-            let audio = self.synthesize_segment(session, voice, chunk, clamped_speed)?;
+            let audio = self.synthesize_segment(&session, voice, chunk, clamped_speed)?;
             append_with_crossfade(&mut combined, &audio, overlap);
         }
 
@@ -328,7 +459,11 @@ impl TtsEngine {
         // count excluding the boundary tokens (reference: `pack[len(ps)-1]`).
         let style = self.parse_voice_style(voice, count.saturating_sub(1))?;
 
-        self.run_inference(session, tokens, style, speed)
+        // Tagged, because only a failure inside the session is worth rebuilding
+        // the engine on another device for: an unknown voice or an over-long
+        // segment fails the same way wherever the model runs.
+        self.run_inference(&session, tokens, style, speed)
+            .map_err(|e| format!("{}{}: {}", INFERENCE_FAILED_ON, self.backend(), e))
     }
 
     /// Save audio as WAV file
