@@ -1,25 +1,30 @@
 //! Grapheme-to-phoneme conversion, one backend per Kokoro language.
 //!
 //! Kokoro-82M is not a single-alphabet model. Its nine language codes were
-//! trained against three different front ends, and feeding one language's
+//! trained against different front ends, and feeding one language's
 //! phonemes to another voice is what makes a voice sound "off" rather than
 //! wrong-in-an-obvious-way:
 //!
-//! | code  | voices        | front end                                    |
-//! |-------|---------------|----------------------------------------------|
-//! | a / b | `af_ am_ bf_ bm_` | eSpeak NG (`en-us` / `en-gb`) + misaki rewrites |
-//! | e f h i p | `ef_ em_ ff_ hf_ hm_ if_ im_ pf_ pm_` | eSpeak NG, one voice each |
-//! | z     | `zf_ zm_`     | jieba + pinyin + misaki's transcription tables |
-//! | j     | `jf_ jm_`     | OpenJTalk + misaki's katakana table            |
+//! | code      | voices                                | front end                          |
+//! |-----------|---------------------------------------|-------------------------------------|
+//! | a / b     | `af_ am_ bf_ bm_`                     | [`en`]: misaki's dictionary + fallback rules |
+//! | e / i / f / p | `ef_ em_ if_ im_ ff_ ff_ pf_ pm_`  | [`romance`]: hand-written rules per language |
+//! | h         | `hf_ hm_`                             | [`hi`]: Devanagari letter-to-sound rules |
+//! | z         | `zf_ zm_`                             | jieba + pinyin + misaki's transcription tables |
+//! | j         | `jf_ jm_`                             | OpenJTalk + misaki's katakana table |
 //!
-//! eSpeak has no usable Mandarin or Japanese front end for this purpose: its
-//! `cmn` voice emits tone *digits*, which are not in the model's vocabulary at
-//! all, and its `ja` voice cannot read kanji - it falls back to spelling them
-//! out in English. Those two languages get dedicated backends.
+//! English is dictionary-first using misaki's own (Apache-2.0) lexicons, and
+//! the rest are small from-scratch rule sets, since
+//! Spanish/Italian/French/Portuguese/Hindi orthography is regular enough
+//! that spelling determines pronunciation almost completely. See each
+//! submodule's docs for what is and is not covered.
 
-pub(crate) mod espeak;
+pub(crate) mod en;
+pub(crate) mod hi;
 pub(crate) mod ja;
 mod ja_data;
+pub(crate) mod romance;
+mod text;
 pub(crate) mod zh;
 mod zh_syllables;
 
@@ -66,10 +71,10 @@ impl Lang {
 
     /// Best-effort match for a language name a caller passed explicitly.
     ///
-    /// Accepts the Kokoro single-letter codes, BCP-47-ish tags and the eSpeak
-    /// voice names. `"en"` deliberately resolves to British English because
-    /// that is what eSpeak's `en` voice is; callers who want the American
-    /// accent should say `en-us`, or simply let the voice decide.
+    /// Accepts the Kokoro single-letter codes and BCP-47-ish tags. `"en"`
+    /// resolves to British English; callers who want the American accent
+    /// should say `en-us`, or simply let the voice decide via
+    /// [`Lang::from_voice`].
     pub fn from_name(name: &str) -> Option<Self> {
         let name = name.trim().to_ascii_lowercase();
         Some(match name.as_str() {
@@ -100,28 +105,6 @@ impl Lang {
             Lang::Mandarin => 'z',
         }
     }
-
-    /// eSpeak voice names to try for this language, best first.
-    ///
-    /// `espeak_SetVoiceByName` matches the voice *file* name, not the language
-    /// code the `--voices` listing prints, and the two only sometimes agree:
-    /// American English is the file `en-US` so `en-us` resolves, but British
-    /// English is the file `en` and `en-gb` does not resolve at all. Likewise
-    /// `pt-br` works while `fr-fr` does not. Rather than hard-code one spelling
-    /// per language and hope, list the candidates and take the first that the
-    /// installed espeak-ng actually knows.
-    pub(crate) fn espeak_voices(self) -> &'static [&'static str] {
-        match self {
-            Lang::AmericanEnglish => &["en-us", "gmw/en-US"],
-            Lang::BritishEnglish => &["en-gb", "en", "gmw/en"],
-            Lang::Spanish => &["es", "roa/es"],
-            Lang::French => &["fr-fr", "fr", "roa/fr"],
-            Lang::Hindi => &["hi", "inc/hi"],
-            Lang::Italian => &["it", "roa/it"],
-            Lang::BrazilianPortuguese => &["pt-br", "roa/pt-BR"],
-            Lang::Japanese | Lang::Mandarin => &[],
-        }
-    }
 }
 
 /// Whether the model has a token for this phoneme.
@@ -140,7 +123,12 @@ pub fn phonemize(text: &str, lang: Lang) -> Result<String, String> {
     match lang {
         Lang::Mandarin => Ok(zh::phonemize(text)),
         Lang::Japanese => Ok(ja::phonemize(text)),
-        other => espeak::phonemize(text, other.espeak_voices(), other),
+        Lang::AmericanEnglish | Lang::BritishEnglish => en::phonemize(text, lang),
+        Lang::Spanish => romance::es::phonemize(text),
+        Lang::Italian => romance::it::phonemize(text),
+        Lang::French => romance::fr::phonemize(text),
+        Lang::BrazilianPortuguese => romance::pt::phonemize(text),
+        Lang::Hindi => hi::phonemize(text),
     }
 }
 
@@ -179,45 +167,57 @@ mod tests {
     }
 
     #[test]
-    fn american_and_british_use_different_espeak_voices() {
-        assert_eq!(Lang::AmericanEnglish.espeak_voices()[0], "en-us");
-        assert_ne!(
-            Lang::BritishEnglish.espeak_voices(),
-            Lang::AmericanEnglish.espeak_voices()
-        );
-    }
-
-    #[test]
-    fn portuguese_is_brazilian() {
-        assert!(
-            Lang::BrazilianPortuguese
-                .espeak_voices()
-                .iter()
-                .all(|v| v.to_ascii_lowercase().contains("pt-br")),
-            "Kokoro's p voices are Brazilian; espeak's plain `pt` is European"
-        );
-    }
-
-    #[test]
-    fn cjk_languages_do_not_go_through_espeak() {
-        assert!(Lang::Mandarin.espeak_voices().is_empty());
-        assert!(Lang::Japanese.espeak_voices().is_empty());
-    }
-
-    #[test]
-    fn every_espeak_language_resolves_to_an_installed_voice() {
-        for lang in [
-            Lang::AmericanEnglish,
-            Lang::BritishEnglish,
-            Lang::Spanish,
-            Lang::French,
-            Lang::Hindi,
-            Lang::Italian,
-            Lang::BrazilianPortuguese,
+    fn every_language_produces_phonemes_known_to_the_model() {
+        for (lang, sample) in [
+            (Lang::AmericanEnglish, "hello"),
+            (Lang::BritishEnglish, "hello"),
+            (Lang::Spanish, "hola"),
+            (Lang::French, "bonjour"),
+            (Lang::Hindi, "नमस्ते"),
+            (Lang::Italian, "ciao"),
+            (Lang::BrazilianPortuguese, "olá"),
         ] {
-            let ps = phonemize("hello", lang)
-                .unwrap_or_else(|e| panic!("{:?}: {e}", lang));
+            let ps = phonemize(sample, lang).unwrap_or_else(|e| panic!("{:?}: {e}", lang));
             assert!(!ps.is_empty(), "{:?} produced no phonemes", lang);
+            for c in ps.chars() {
+                assert!(is_known(c), "{lang:?}: {c:?} in {ps:?} is not in the model vocabulary");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cross_language_regression {
+    use super::*;
+
+    /// A realistic sentence per language plus a battery of edge cases
+    /// (empty, whitespace-only, bare punctuation, numbers), checked against
+    /// every backend at once - the individual per-module tests cover a
+    /// backend's own rules in detail, this one is the "did wiring a language
+    /// through `phonemize` actually work" smoke test.
+    #[test]
+    fn every_language_handles_its_sample_and_edge_cases() {
+        let samples: &[(Lang, &str)] = &[
+            (Lang::AmericanEnglish, "Hello, I made a mistake today. Go outside now! It costs $5.50, that's 24 apples."),
+            (Lang::BritishEnglish, "Hello, I made a mistake today. Go outside now!"),
+            (Lang::Spanish, "Hola, ¿cómo estás hoy? Vamos al parque esta tarde."),
+            (Lang::French, "Bonjour, comment allez-vous aujourd'hui ? Allons au parc."),
+            (Lang::Italian, "Ciao, come stai oggi? Andiamo al parco questo pomeriggio."),
+            (Lang::BrazilianPortuguese, "Olá, como você está hoje? Vamos ao parque esta tarde."),
+            (Lang::Hindi, "नमस्ते, आप आज कैसे हैं? आज मौसम बहुत अच्छा है।"),
+            (Lang::Mandarin, "你好，世界。我们今天去公园散步，好吗？"),
+            (Lang::Japanese, "こんにちは。今日はいい天気ですね。"),
+        ];
+        for (lang, text) in samples {
+            let ps = phonemize(text, *lang).unwrap_or_else(|e| panic!("{lang:?} sample failed: {e}"));
+            assert!(!ps.is_empty(), "{lang:?} produced empty output for sample");
+            let unknown: Vec<char> = ps.chars().filter(|c| !is_known(*c)).collect();
+            assert!(unknown.is_empty(), "{lang:?}: unknown phonemes {unknown:?} in {ps:?}");
+
+            // Edge cases: must not panic, on any language.
+            for edge in ["", "   ", "!!!???", "123", "42.5", "-7"] {
+                let _ = phonemize(edge, *lang);
+            }
         }
     }
 }

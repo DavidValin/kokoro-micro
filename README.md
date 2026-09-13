@@ -25,48 +25,21 @@ All nine are built in; there is nothing to enable.
 
 | Kokoro code | Voices | Front end |
 |---|---|---|
-| `a` | `af_* am_*` (20) | eSpeak NG `en-us` + misaki rewrites |
-| `b` | `bf_* bm_*` (8) | eSpeak NG `en-gb` + misaki rewrites |
-| `e` `f` `h` `i` `p` | `ef_ em_ ff_ hf_ hm_ if_ im_ pf_ pm_` (13) | eSpeak NG, one voice per language |
+| `a` | `af_* am_*` (20) | dictionary-first English (misaki's lexicons) + fallback rules |
+| `b` | `bf_* bm_*` (8) | dictionary-first English (misaki's lexicons) + fallback rules |
+| `e` `i` `f` `p` | `ef_ em_ if_ im_ ff_ fm_ pf_ pm_` (13) | hand-written per-language letter-to-sound rules |
+| `h` | `hf_ hm_` | Devanagari letter-to-sound rules |
 | `z` | `zf_* zm_*` (8) | jieba + pinyin + misaki's transcription tables |
 | `j` | `jf_* jm_*` (5) | OpenJTalk (`jpreprocess`) + misaki's kana table |
 
-This is not incidental detail. Kokoro-82M was trained against three different
+This is not incidental detail. Kokoro-82M was trained against different
 grapheme-to-phoneme front ends, each speaking a different phoneme alphabet, and
 the model's vocabulary is only 114 tokens wide. Anything outside it is dropped
 before inference, so a language handled by the wrong front end does not fail
-loudly - it comes back mumbling. Two examples of what that looked like before
-this crate grew per-language front ends:
-
-- eSpeak's Mandarin voice writes tones as **digits** (`hˈɑu2`), and the model has
-  no digit tokens. Every tone in the sentence was dropped. Mandarin needs
-  `→ ↗ ↓ ↘`, which only the misaki tables produce.
-- eSpeak cannot read kanji. It fell back to spelling them out *in English*, so
-  今日 came out as the English words "chinese letter".
-
-### eSpeak NG data
-
-The eSpeak-backed languages need `espeak-ng-data`. It is looked for, in order,
-in `$PIPER_ESPEAKNG_DATA_DIRECTORY`, `$ESPEAK_DATA_PATH`, the current directory,
-next to the executable (and one level up, so `target/release/examples/foo`
-finds `target/release`), the directory the build installed it to, and finally
-the usual system prefixes - `/usr/share`, `/usr/local/share`, `/opt/homebrew/share`
-and friends. Each is checked for a real `espeak-ng-data/phontab` before being
-used, and the search continues past any that does not have one; the environment
-variables are a hint about where to look first, not a hard override. A system
-install of espeak-ng therefore needs no configuration at all.
-
-Do not rely on espeak-ng's own built-in default path. `espeak-rs-sys` compiles
-in the `OUT_DIR` of whichever build produced the library, which is a path under
-`target/` that will not survive a `cargo clean`, a dependency bump, or moving
-the binary to another machine - and when it goes stale espeak prints a bare
-"No such file or directory" for `phontab` and then fails to initialize.
-
-One caveat if you ship your own copy of the data: it must come from the same
-espeak-ng release as the linked library. Mixing versions does not error - most
-languages keep working - but the Mandarin tables in particular can decode to
-nonsense. Mandarin no longer goes through eSpeak here, so that mismatch can no
-longer affect it, but it is still worth keeping in sync.
+loudly - it comes back mumbling. Mandarin in particular needs tone contours
+written as `→ ↗ ↓ ↘`, not digits, which is what the misaki-derived tables in
+[`zh.rs`](src/g2p/zh.rs) produce; Japanese needs kanji read through
+`jpreprocess`'s dictionary rather than transliterated letter-by-letter.
 
 ## Installation
 
@@ -284,17 +257,20 @@ Apache-2.0
 
 ## Regenerating the language tables
 
-The Mandarin and Japanese tables under `src/g2p/` are generated and committed;
-a normal build never regenerates them. See [`tools/README.md`](tools/README.md)
-for how to rebuild them against newer upstream data.
+The English, Mandarin and Japanese tables under `src/g2p/` are generated and
+committed; a normal build never regenerates them. See
+[`tools/README.md`](tools/README.md) for how to rebuild them against newer
+upstream data.
 
 ## Credits
 
 Built with the Kokoro 82M parameter TTS model.
 Reduced version from [kokoro-tiny](https://github.com/8b-is/kokoro-tiny) by 8b-is.
 
-The grapheme-to-phoneme tables are ports of [misaki](https://github.com/hexgrad/misaki)
-(Apache-2.0), Kokoro's own G2P: `espeak.py` for the eSpeak-backed languages,
-`transcription.py` for Mandarin (itself from [pinyin-to-ipa](https://github.com/stefantaubert/pinyin-to-ipa), MIT),
-and `cutlet.py` for Japanese (from [polm/cutlet](https://github.com/polm/cutlet), MIT).
+The English lexicons (`src/g2p/en_us.tsv`/`en_gb.tsv`) are generated from
+[misaki](https://github.com/hexgrad/misaki)'s (Apache-2.0) own pronunciation
+dictionaries. The Mandarin/Japanese grapheme-to-phoneme tables are ports of
+misaki's `transcription.py` (itself from
+[pinyin-to-ipa](https://github.com/stefantaubert/pinyin-to-ipa), MIT) and
+`cutlet.py` (from [polm/cutlet](https://github.com/polm/cutlet), MIT), respectively.
 Mandarin phrase readings come from [python-pinyin](https://github.com/mozillazg/python-pinyin) (MIT).

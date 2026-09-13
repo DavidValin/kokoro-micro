@@ -210,7 +210,7 @@ pub(crate) fn phonemize(text: &str) -> String {
     fn flush_latin(latin: &mut String, tokens: &mut Vec<(String, bool, String)>) {
         if !latin.trim().is_empty() {
             let lang = super::Lang::AmericanEnglish;
-            if let Ok(ps) = super::espeak::phonemize(latin.trim(), lang.espeak_voices(), lang) {
+            if let Ok(ps) = super::en::phonemize(latin.trim(), lang) {
                 if !ps.is_empty() {
                     tokens.push((ps, true, String::new()));
                 }
@@ -374,8 +374,6 @@ mod tests {
     fn phonemizes_a_sentence() {
         let ps = phonemize("こんにちは。今日はいい天気ですね。");
         assert!(!ps.is_empty(), "no output - is the bundled dictionary available?");
-        // The failure this replaces: espeak read the kanji as the English
-        // words "chinese letter", so the output was full of English phonemes.
         assert!(!ps.contains('A'), "English diphthong token in {ps}");
         let unknown: Vec<char> = ps.chars().filter(|c| !super::super::is_known(*c)).collect();
         assert!(unknown.is_empty(), "not in the vocabulary: {unknown:?} in {ps}");
