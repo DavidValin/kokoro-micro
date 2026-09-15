@@ -1,8 +1,7 @@
 [package]
 name = "kokoro-micro"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
-build = "build.rs"
 authors = ["Hue & Aye <team@8b.is>", "David Valin <hola@davidvalin.com>", "mik-tf"]
 description = "Minimal TTS crate using Kokoro - perfect for embedding in other apps"
 license = "Apache-2.0"
@@ -14,12 +13,12 @@ keywords = ["tts", "text-to-speech", "kokoro", "audio", "voice"]
 categories = ["multimedia::audio", "multimedia"]
 exclude = ["*.wav", "*.mp3", "*.opus", "*.flac", "target/", ".git/", ".DS_Store", "0.onnx", "0.bin", "models/"]
 include = [
-    "src/**/*", "Cargo.toml", "LICENSE", "NOTICE", "README.md", "build.rs",
+    "src/**/*", "Cargo.toml", "LICENSE", "NOTICE", "README.md",
     "examples/**/*", "assets/fallback.wav",
     # Generators for the committed language tables, so the crate on crates.io
     # is reproducible from its own sources.
     "tools/README.md", "tools/gen_zh_data.py", "tools/gen_ja_data.py",
-    "tools/kokoro_vocab.json",
+    "tools/gen_en_data.py", "tools/kokoro_vocab.json",
 ]
 
 [dependencies]
@@ -31,10 +30,6 @@ hound = "3.5.1"  # WAV support built-in
 ndarray = "0.17.2"
 ndarray-npy = "0.10.0"
 
-# eSpeak NG, used directly rather than through the `espeak-rs` wrapper: the
-# model needs tie-marked phonemes (`phonememode` bit 7) and per-clause
-# punctuation, neither of which that wrapper's API can express.
-espeak-rs-sys = "0.1.9"
 
 # Mandarin: word segmentation and character readings.
 jieba-rs = "0.10"

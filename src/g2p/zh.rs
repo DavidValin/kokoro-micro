@@ -308,7 +308,7 @@ pub(crate) fn phonemize(text: &str) -> String {
     fn flush_latin(latin: &mut String, out: &mut String) {
         if !latin.trim().is_empty() {
             let lang = super::Lang::AmericanEnglish;
-            if let Ok(ipa) = super::espeak::phonemize(latin.trim(), lang.espeak_voices(), lang) {
+            if let Ok(ipa) = super::en::phonemize(latin.trim(), lang) {
                 if !ipa.is_empty() {
                     if !out.is_empty() && !out.ends_with(' ') {
                         out.push(' ');
